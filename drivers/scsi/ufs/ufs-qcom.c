@@ -33,7 +33,7 @@
 #include "ufshci.h"
 #include "ufs_quirks.h"
 #include "ufshcd-crypto-qti.h"
-
+#include <trace/hooks/ufshcd.h>
 
 #define UFS_QCOM_DEFAULT_DBG_PRINT_EN	\
 	(UFS_QCOM_DBG_PRINT_REGS_EN | UFS_QCOM_DBG_PRINT_TEST_BUS_EN)
@@ -476,9 +476,8 @@ static void ufs_qcom_select_unipro_mode(struct ufs_qcom_host *host)
 	ufshcd_rmwl(host->hba, QUNIPRO_SEL,
 		   ufs_qcom_cap_qunipro(host) ? QUNIPRO_SEL : 0,
 		   REG_UFS_CFG1);
-
-	if (host->hw_ver.major >= 0x05)
-		ufshcd_rmwl(host->hba, QUNIPRO_G4_SEL, 0, REG_UFS_CFG0);
+	/* make sure above configuration is applied before we return */
+	mb();
 }
 
 /*
@@ -527,14 +526,6 @@ static int ufs_qcom_host_reset(struct ufs_hba *hba)
 	 * so that the ice hardware will be re-initialized properly in the
 	 * later part of the UFS host controller reset.
 	 */
-	ufs_qcom_ice_disable(host);
-
-	/*
-	* The ice registers are also reset to default values after a ufs
-	* host controller reset. Reset the ice internal software flags here
-	* so that the ice hardware will be re-initialized properly in the
-	* later part of the UFS host controller reset.
-	*/
 	ufs_qcom_ice_disable(host);
 
 	if (reenable_intr) {
@@ -647,7 +638,83 @@ static int ufs_qcom_enable_hw_clk_gating(struct ufs_hba *hba)
 		REG_UFS_CFG2);
 
 	/* Ensure that HW clock gating is enabled before next operations */
-	ufshcd_readl(hba, REG_UFS_CFG2);
+	mb();
+
+	/* Enable Qunipro internal clock gating if supported */
+	if (!ufs_qcom_cap_qunipro_clk_gating(host))
+		goto out;
+
+	/* Enable all the mask bits */
+	err = ufshcd_dme_rmw(hba, DL_VS_CLK_CFG_MASK,
+				DL_VS_CLK_CFG_MASK, DL_VS_CLK_CFG);
+	if (err)
+		goto out;
+
+	/*
+	 * As per HPG, ATTR_HW_CGC_EN bit should be enabled when operating at
+	 * more than 300mhz for target which support multi level clk scaling
+	 * and hence should be disable in UFS init sequence for those target.
+	 * For rest all other target set the default to 1 like earlier target.
+	 * CGC bit should be enabled for target supporting multilevel and
+	 * irrespective of type of UFS device.
+	 */
+	if (of_property_read_bool(np, "disable-cgc")) {
+		if (host->ml_scale_sup &&
+			(clk_get_rate(clki->clk) > UFS_NOM_THRES_FREQ))
+			err = ufshcd_dme_rmw(hba, PA_VS_CLK_CFG_REG_MASK,
+			PA_VS_CLK_CFG_REG_MASK, PA_VS_CLK_CFG_REG);
+		else
+			err = ufshcd_dme_rmw(hba, PA_VS_CLK_CFG_REG_MASK,
+					 PA_VS_CLK_CFG_REG_MASK1, PA_VS_CLK_CFG_REG);
+	} else {
+		err = ufshcd_dme_rmw(hba, PA_VS_CLK_CFG_REG_MASK,
+				PA_VS_CLK_CFG_REG_MASK, PA_VS_CLK_CFG_REG);
+	}
+
+	if (err)
+		goto out;
+
+	if (!((host->hw_ver.major == 4) && (host->hw_ver.minor == 0) &&
+	     (host->hw_ver.step == 0))) {
+		err = ufshcd_dme_rmw(hba, DME_VS_CORE_CLK_CTRL_DME_HW_CGC_EN,
+					DME_VS_CORE_CLK_CTRL_DME_HW_CGC_EN,
+					DME_VS_CORE_CLK_CTRL);
+	} else {
+		dev_err(hba->dev, "%s: skipping DME_HW_CGC_EN set\n",
+			__func__);
+	}
+out:
+	return err;
+}
+
+static void ufs_qcom_force_mem_config(struct ufs_hba *hba)
+{
+	struct ufs_clk_info *clki;
+
+	/*
+	 * Configure the behavior of ufs clocks core and peripheral
+	 * memory state when they are turned off.
+	 * This configuration is required to allow retaining
+	 * ICE crypto configuration (including keys) when
+	 * core_clk_ice is turned off, and powering down
+	 * non-ICE RAMs of host controller.
+	 *
+	 * This is applicable only to gcc clocks.
+	 */
+	list_for_each_entry(clki, &hba->clk_list_head, list) {
+
+		/* skip it for non-gcc (rpmh) clocks */
+		if (!strcmp(clki->name, "ref_clk"))
+			continue;
+
+		if (!strcmp(clki->name, "core_clk_ice") ||
+			!strcmp(clki->name, "core_clk_ice_hw_ctl"))
+			qcom_clk_set_flags(clki->clk, CLKFLAG_RETAIN_MEM);
+		else
+			qcom_clk_set_flags(clki->clk, CLKFLAG_NORETAIN_MEM);
+		qcom_clk_set_flags(clki->clk, CLKFLAG_NORETAIN_PERIPH);
+		qcom_clk_set_flags(clki->clk, CLKFLAG_PERIPH_OFF_CLEAR);
+	}
 }
 
 static int ufs_qcom_hce_enable_notify(struct ufs_hba *hba,
@@ -772,7 +839,7 @@ static int __ufs_qcom_cfg_timers(struct ufs_hba *hba, u32 gear,
 		 * make sure above write gets applied before we return from
 		 * this function.
 		 */
-		ufshcd_readl(hba, REG_UFS_SYS1CLK_1US);
+		mb();
 	}
 
 	if (ufs_qcom_cap_qunipro(host))
@@ -834,16 +901,6 @@ static int __ufs_qcom_cfg_timers(struct ufs_hba *hba, u32 gear,
 		/*
 		 * make sure above write gets applied before we return from
 		 * this function.
-		 */
-		mb();
-	}
-
-	if (update_link_startup_timer && host->hw_ver.major != 0x5) {
-		ufshcd_writel(hba, ((core_clk_rate / MSEC_PER_SEC) * 100),
-			      REG_UFS_CFG0);
-		/*
-		 * make sure that this configuration is applied before
-		 * we return
 		 */
 		mb();
 	}
@@ -2225,9 +2282,6 @@ static u32 ufs_qcom_get_ufs_hci_version(struct ufs_hba *hba)
 static void ufs_qcom_advertise_quirks(struct ufs_hba *hba)
 {
 	struct ufs_qcom_host *host = ufshcd_get_variant(hba);
-#ifdef CONFIG_UFS_EBUFF
-	u32 value = 0;
-#endif
 
 	if (host->hw_ver.major == 0x01) {
 		hba->quirks |= UFSHCD_QUIRK_DELAY_BEFORE_DME_CMDS
@@ -2253,19 +2307,6 @@ static void ufs_qcom_advertise_quirks(struct ufs_hba *hba)
 	if (host->disable_lpm)
 		hba->quirks |= UFSHCD_QUIRK_BROKEN_AUTO_HIBERN8;
 
-#ifdef CONFIG_UFS_EBUFF
-	if (ebuff_value_u32("host_quirks", &value)) {
-		u32 mask = 0;
-		if (ebuff_value_u32("host_quirks_mask", &mask)) {
-			dev_info(hba->dev, "%s: ebuff origin host_quirks 0x%x value 0x%x mask 0x%x\n", __func__, hba->quirks, value, mask);
-			hba->quirks = (hba->quirks & (~mask)) | (value & mask);
-		} else {
-			dev_info(hba->dev, "%s: ebuff origin host_quirks 0x%x value 0x%x\n", __func__, hba->quirks, value);
-			hba->quirks |= value;
-		}
-	}
-#endif
-
 #if IS_ENABLED(CONFIG_SCSI_UFS_CRYPTO_QTI)
 	hba->quirks |= UFSHCD_QUIRK_CUSTOM_KEYSLOT_MANAGER;
 #endif
@@ -2274,9 +2315,6 @@ static void ufs_qcom_advertise_quirks(struct ufs_hba *hba)
 static void ufs_qcom_set_caps(struct ufs_hba *hba)
 {
 	struct ufs_qcom_host *host = ufshcd_get_variant(hba);
-#ifdef CONFIG_UFS_EBUFF
-	u32 value = 0;
-#endif
 
 	if (!host->disable_lpm) {
 		hba->caps |= UFSHCD_CAP_CLK_GATING |
@@ -2307,18 +2345,6 @@ static void ufs_qcom_set_caps(struct ufs_hba *hba)
 		 */
 		host->caps |= UFS_QCOM_CAP_SVS2;
 	}
-#ifdef CONFIG_UFS_EBUFF
-	if (ebuff_value_u32("caps", &value)) {
-		u32 mask = 0;
-		if (ebuff_value_u32("caps_mask", &mask)) {
-			dev_info(hba->dev, "%s: ebuff origin caps 0x%x value 0x%x mask 0x%x\n", __func__, hba->caps, value, mask);
-			hba->caps = (hba->caps & (~mask)) | (value & mask);
-		} else {
-			dev_info(hba->dev, "%s: ebuff origin caps 0x%x value 0x%x\n", __func__, host->caps, value);
-			host->caps |= value;
-		}
-	}
-#endif
 }
 
 static int ufs_qcom_unvote_qos_all(struct ufs_hba *hba)
@@ -4262,9 +4288,6 @@ cell_put:
 static void ufs_qcom_parse_limits(struct ufs_qcom_host *host)
 {
 	struct device_node *np = host->hba->dev->of_node;
-#ifdef CONFIG_UFS_EBUFF
-	u32 ebuff_value = 0;
-#endif
 
 	if (!np)
 		return;
@@ -4285,22 +4308,6 @@ static void ufs_qcom_parse_limits(struct ufs_qcom_host *host)
 	of_property_read_u32(np, "limit-phy-submode", &host->limit_phy_submode);
 	of_property_read_u32(np, "ufs-dev-types", &host->ufs_dev_types);
 	host->ufs_dev_revert = of_property_read_bool(np, "qcom,ufs-dev-revert");
-
-#ifdef CONFIG_UFS_EBUFF
-	if (ebuff_value_u32("rate", &ebuff_value)) {
-		if (ebuff_value == 1)
-			host->limit_rate = PA_HS_MODE_A;
-		else if (ebuff_value == 2)
-			host->limit_rate = PA_HS_MODE_B;
-	}
-
-	if (ebuff_value_u32("gear", &ebuff_value)) {
-		if (ebuff_value >= 1 && ebuff_value <= 4) {
-			host->limit_tx_hs_gear = (int)ebuff_value;
-			host->limit_rx_hs_gear = (int)ebuff_value;
-		}
-	}
-#endif
 
 	if (host->ufs_dev_types >= 2)
 		ufs_qcom_read_nvmem_cell(host);
@@ -4416,20 +4423,8 @@ static void ufs_qcom_hook_clock_scaling(void *unused, struct ufs_hba *hba, bool 
 static void ufs_qcom_parse_lpm(struct ufs_qcom_host *host)
 {
 	struct device_node *node = host->hba->dev->of_node;
-#ifdef CONFIG_UFS_EBUFF
-	u32 ebuff_value = 2;
-#endif
 
 	host->disable_lpm = of_property_read_bool(node, "qcom,disable-lpm");
-#ifdef CONFIG_UFS_EBUFF
-	if (ebuff_value_u32("disable_lpm", &ebuff_value)) {
-		if (ebuff_value == 0)
-			host->disable_lpm = false;
-		else if (ebuff_value == 1)
-			host->disable_lpm = true;
-	}
-#endif
-
 	if (host->disable_lpm)
 		dev_info(host->hba->dev, "(%s) All LPM is disabled\n",
 			 __func__);
@@ -5086,10 +5081,6 @@ static int ufs_qcom_probe(struct platform_device *pdev)
 	    strlen(android_boot_dev) &&
 	    strcmp(android_boot_dev, dev_name(dev)))
 		return -ENODEV;
-
-#ifdef CONFIG_UFS_EBUFF
-	of_obtain_ebuffha_info();
-#endif
 
 	/* Perform generic probe */
 	err = ufshcd_pltfrm_init(pdev, &ufs_hba_qcom_vops);
